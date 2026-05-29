@@ -9,7 +9,9 @@
 
 #define BUFFER_SIZE 65536
 #define KEY_FILE_NAME "GEMINI_API_KEY"
+#define MAX_RETRIES 4
 
+// Standard function pointer signature for our dynamic target evaluations
 typedef int (*BytecodeFunc)(int, int);
 
 struct ResponseBuffer {
@@ -17,6 +19,7 @@ struct ResponseBuffer {
     size_t size;
 };
 
+// Standard write callback for libcurl to dump incoming response chunk payloads
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     struct ResponseBuffer *mem = (struct ResponseBuffer *)userp;
@@ -29,6 +32,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     return realsize;
 }
 
+// Scans current directory working space for compiled raw machine binary blocks
 void list_available_raw_files(void) {
     DIR *d = opendir(".");
     int count = 0;
@@ -51,6 +55,7 @@ void list_available_raw_files(void) {
     printf("\n");
 }
 
+// Loads our Gemini API key from local storage file or systems environment 
 int load_api_key(char *dest, size_t max_len) {
     FILE *f = fopen(KEY_FILE_NAME, "r");
     if (f) {
@@ -70,7 +75,7 @@ int load_api_key(char *dest, size_t max_len) {
     return 0;
 }
 
-// Extract raw content inside Gemini JSON "text" response string block
+// Decodes and extracts code contents directly out of the incoming Gemini JSON context
 void extract_clean_source(const char *json, char *output, size_t max_len) {
     const char *target = "\"text\": \"";
     char *start = strstr(json, target);
@@ -81,12 +86,10 @@ void extract_clean_source(const char *json, char *output, size_t max_len) {
     start += strlen(target);
     
     size_t out_idx = 0;
-    int in_markdown = 0;
-
     while (*start && *start != '"' && out_idx < max_len - 1) {
-        // Look past basic escaped structural characters or Markdown definitions back-to-back
-        if (strncmp(start, "```c", 4) == 0) { start += 4; in_markdown = 1; continue; }
-        if (strncmp(start, "```", 3) == 0) { start += 3; in_markdown = 0; continue; }
+        // Strip markdown backticks standard output formats safely
+        if (strncmp(start, "```c", 4) == 0) { start += 4; continue; }
+        if (strncmp(start, "```", 3) == 0) { start += 3; continue; }
         if (*start == '\\' && *(start + 1) == 'n') {
             output[out_idx++] = '\n';
             start += 2;
@@ -102,12 +105,12 @@ void extract_clean_source(const char *json, char *output, size_t max_len) {
             start += 2;
             continue;
         }
-        
         output[out_idx++] = *start++;
     }
     output[out_idx] = '\0';
 }
 
+// Maps, copies, and dynamically executes raw machine instructions directly inside a virtual page
 void execute_raw_file(const char *filename, int p1, int p2) {
     FILE *f = fopen(filename, "rb");
     if (!f) {
@@ -120,7 +123,7 @@ void execute_raw_file(const char *filename, int p1, int p2) {
     fseek(f, 0, SEEK_SET);
 
     if (size <= 0) {
-        fprintf(stderr, "[ Failure ] Target runtime binary file payload is empty.\n");
+        fprintf(stderr, "[ Failure ] Target binary file payload is empty.\n");
         fclose(f);
         return;
     }
@@ -130,9 +133,10 @@ void execute_raw_file(const char *filename, int p1, int p2) {
     size_t read_bytes = fread(buffer, 1, size, f);
     fclose(f);
 
+    // Secure an executable, writeable and readable private page boundary
     void *exec_mem = mmap(NULL, read_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (exec_mem == MAP_FAILED) {
-        perror("[ Engine ] Execution context memory allocation page fault");
+        perror("[ Engine ] Memory allocation page fault on JIT generation");
         free(buffer);
         return;
     }
@@ -141,70 +145,80 @@ void execute_raw_file(const char *filename, int p1, int p2) {
     free(buffer);
 
     BytecodeFunc LoadedFunc = (BytecodeFunc)exec_mem;
-    printf("[ Engine ] Executing file-loaded bytecode '%s' with inputs (%d, %d)...\n", filename, p1, p2);
+    printf("[ Engine ] Executing bytecode '%s' with inputs (%d, %d)...\n", filename, p1, p2);
     int res_val = LoadedFunc(p1, p2);
     printf("[ Engine ] Return code evaluated: %d\n", res_val);
 
     munmap(exec_mem, read_bytes);
 }
 
-void compile_source_to_raw(const char *c_code, const char *save_filename) {
-    FILE *src = fopen("temp_jit.c", "w");
-    if (!src) {
-        fprintf(stderr, "[ Failure ] Failed to create temporary source file.\n");
-        return;
+// Escapes critical structures for secure, stringified transit within JSON packages
+void json_escape(const char *src, char *dest, size_t max_len) {
+    size_t d_idx = 0;
+    for (size_t i = 0; src[i] != '\0' && d_idx < max_len - 3; i++) {
+        if (src[i] == '"' || src[i] == '\\') {
+            dest[d_idx++] = '\\';
+            dest[d_idx++] = src[i];
+        } else if (src[i] == '\n') {
+            dest[d_idx++] = '\\';
+            dest[d_idx++] = 'n';
+        } else {
+            dest[d_idx++] = src[i];
+        }
     }
-    // Automatically wrap includes just in case the LLM outputs only raw functions
-    fprintf(src, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n");
-    fprintf(src, "%s\n", c_code);
-    fclose(src);
-
-    char cmd[1024];
-    // Compile to shared library object 
-    snprintf(cmd, sizeof(cmd), "cc -O2 -shared -fPIC temp_jit.c -o temp_jit.so -lm");
-    if (system(cmd) != 0) {
-        fprintf(stderr, "[ Failure ] Local cc engine compilation failed. Invalid C syntax.\n");
-        unlink("temp_jit.c");
-        return;
-    }
-
-    // Extract text segment out directly into raw application bytecode machine code file
-    snprintf(cmd, sizeof(cmd), "objcopy -O binary --only-section=.text temp_jit.so %s", save_filename);
-    if (system(cmd) != 0) {
-        fprintf(stderr, "[ Failure ] Extracting machine bytecode via objcopy failed.\n");
-    } else {
-        printf("[ Storage ] Successfully generated compiled bytecode asset -> %s\n", save_filename);
-    }
-
-    unlink("temp_jit.c");
-    unlink("temp_jit.so");
+    dest[d_idx] = '\0';
 }
 
-void prompt_gemini_and_build(const char *api_key, const char *prompt, const char *save_filename) {
+// Helper to pull text from disk directly back into dynamic string context buffers
+char *read_file_to_string(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    char *str = malloc(size + 1);
+    if (str) {
+        size_t read_bytes = fread(str, 1, size, f);
+        str[read_bytes] = '\0';
+    }
+    fclose(f);
+    return str;
+}
+
+// Interfaces with the Gemini API to request code transformations
+int invoke_gemini_api(const char *api_key, const char *prompt, char *output_source, size_t max_len) {
     CURL *curl;
     CURLcode res;
     struct ResponseBuffer response = { .size = 0 };
-    char url[512];
+    char url[1024];
+    static char json_payload[BUFFER_SIZE];
 
-    snprintf(url, sizeof(url), "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", api_key);
-
-    // Escape basic quotation constraints safely 
-    char escaped_prompt[2048] = {0};
-    size_t ep_idx = 0;
-    for (size_t i = 0; prompt[i] != '\0' && ep_idx < sizeof(escaped_prompt) - 2; i++) {
-        if (prompt[i] == '"' || prompt[i] == '\\') {
-            escaped_prompt[ep_idx++] = '\\';
+    // Automatically check for custom URL configuration in environment variables
+    const char *env_url = getenv("GEMINI_API_URL");
+    if (env_url && strlen(env_url) > 0) {
+        // If API key is already embedded in the custom URL, use it directly
+        if (strstr(env_url, "key=")) {
+            snprintf(url, sizeof(url), "%s", env_url);
+        } else {
+            // Append API key cleanly, detecting query parameters
+            char separator = strchr(env_url, '?') ? '&' : '?';
+            snprintf(url, sizeof(url), "%s%ckey=%s", env_url, separator, api_key);
         }
-        escaped_prompt[ep_idx++] = prompt[i];
+    } else {
+        // Default preview environment API endpoint
+        snprintf(url, sizeof(url), "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=%s", api_key);
     }
 
-    char json_payload[4096];
+    static char escaped_prompt[BUFFER_SIZE / 2];
+    json_escape(prompt, escaped_prompt, sizeof(escaped_prompt));
+
     snprintf(json_payload, sizeof(json_payload),
-             "{\"contents\": [{\"parts\": [{\"text\": \"Write a single pure C language function named custom_func taking two integers and returning an integer: 'int custom_func(int a, int b)'. Output only code block structure markdown context. No extra chatter or descriptions. Goal: %s\"}]}]}",
+             "{\"contents\": [{\"parts\": [{\"text\": \"%s\"}]}]}",
              escaped_prompt);
 
     curl = curl_easy_init();
-    if (!curl) return;
+    if (!curl) return 0;
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -215,28 +229,114 @@ void prompt_gemini_and_build(const char *api_key, const char *prompt, const char
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response);
 
-    printf("[ Pipeline ] Fetching custom C implementation from Gemini API...\n");
     res = curl_easy_perform(curl);
     
-    if (res != CURLE_OK) {
-        fprintf(stderr, "[ Failure ] Network transmission failed: %s\n", curl_easy_strerror(res));
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        return;
-    }
-
-    char clean_c_code[8192];
-    extract_clean_source(response.data, clean_c_code, sizeof(clean_c_code));
-
-    if (strlen(clean_c_code) == 0) {
-        fprintf(stderr, "[ Failure ] Empty content extraction returned from API layer.\n");
-    } else {
-        printf("[ Local CC ] Source extracted:\n%s\n", clean_c_code);
-        compile_source_to_raw(clean_c_code, save_filename);
+    long http_code = 0;
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     }
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        fprintf(stderr, "[ API Connection ] libcurl connection failed: %s\n", curl_easy_strerror(res));
+        return 0;
+    }
+
+    extract_clean_source(response.data, output_source, max_len);
+    
+    // Diagnostic enhancement: Show the real response details if extraction fails
+    if (strlen(output_source) == 0) {
+        fprintf(stderr, "[ API Diagnostic ] Error: Unable to extract structured C code from response.\n");
+        fprintf(stderr, "[ API Diagnostic ] HTTP Status Code: %ld\n", http_code);
+        fprintf(stderr, "[ API Diagnostic ] Raw JSON Payload:\n%s\n", response.data);
+        return 0;
+    }
+
+    return 1;
+}
+
+// Executes the main feedback negotiation and local C compilation loop
+void auto_negotiate_and_build(const char *api_key, const char *initial_prompt, const char *save_filename) {
+    static char current_prompt[BUFFER_SIZE / 2];
+    static char extracted_c_code[8192];
+    
+    // Highly engineered system prompt predicting and eliminating compilation & JIT issues
+    snprintf(current_prompt, sizeof(current_prompt),
+             "You are a low-level embedded software engine helper. Write a single self-contained C function named 'custom_func' taking two integers and returning an integer: 'int custom_func(int a, int b)'.\n\n"
+             "CRITICAL ARCHITECTURAL CONSTRAINTS:\n"
+             "1. STRICT SIGNATURE: Your function signature must be exactly: int custom_func(int a, int b)\n"
+             "2. NO STRING LITERALS OR CONSTANT STRINGS: Do not use any strings like \"text\", printf(), puts(), or sprintf(). These are compiled into .rodata, which is stripped by the engine and will trigger immediate segmentation faults.\n"
+             "3. NO GLOBAL OR STATIC VARIABLES: All calculations must use standard local stack-allocated variables.\n"
+             "4. standard math.h functions (like sin, cos, pow, sqrt) are available if needed.\n"
+             "5. STRICT FORMATTING: Output ONLY raw C code enclosed in a markdown code block (using triple backticks and 'c'). Absolutely no conversational text, preambles, or explanations.\n\n"
+             "Goal requirement: %s",
+             initial_prompt);
+
+    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        printf("[ Pipeline ] (Attempt %d/%d) Querying Gemini API...\n", attempt, MAX_RETRIES);
+        
+        if (!invoke_gemini_api(api_key, current_prompt, extracted_c_code, sizeof(extracted_c_code))) {
+            fprintf(stderr, "[ Failure ] Compiler pipeline aborted due to API error.\n");
+            return;
+        }
+
+        // Output code payload to disk for the compiler
+        FILE *src = fopen("temp_jit.c", "w");
+        if (!src) return;
+        fprintf(src, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n");
+        fprintf(src, "%s\n", extracted_c_code);
+        fclose(src);
+
+        // Compile dynamically, capture error diagnostics
+        // We use optimal JIT extraction flags: -fno-asynchronous-unwind-tables to strip EH frames, ensuring only clean bytecode is emitted
+        printf("[ Local CC ] Calling local compiler 'cc'...\n");
+        int cc_status = system("cc -O3 -shared -fPIC -fno-asynchronous-unwind-tables -fomit-frame-pointer temp_jit.c -o temp_jit.so -lm 2> cc_errors.log");
+
+        if (cc_status == 0) {
+            // Success! Extract raw assembly/machine code .text bytes from the compiled dynamic object
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd), "objcopy -O binary --only-section=.text temp_jit.so %s", save_filename);
+            if (system(cmd) == 0) {
+                printf("[ Success ] Successfully compiled and linked on attempt %d! Saved block -> %s\n", attempt, save_filename);
+                unlink("temp_jit.c");
+                unlink("temp_jit.so");
+                unlink("cc_errors.log");
+                return;
+            }
+        }
+
+        // Failure! Extract compiler feedback diagnostics and loop them back into the next prompt
+        char *errors = read_file_to_string("cc_errors.log");
+        if (errors && strlen(errors) > 0) {
+            printf("[ Local CC ] Compilation failed! Starting negotiation phase...\n");
+            printf("--- Diagnostic Output ---\n%s-----------------------\n", errors);
+            
+            // Auto-reorganization prompt: guides Gemini directly on the specific errors found
+            snprintf(current_prompt, sizeof(current_prompt),
+                     "Your previous C code implementation has failed to compile.\n\n"
+                     "INSTRUCTIONS TO CORRECT THE IMPLEMENTATION:\n"
+                     "1. Fix the compiler syntax or semantic errors listed below.\n"
+                     "2. Remember to retain the signature 'int custom_func(int a, int b)'.\n"
+                     "3. NEVER introduce any string literals, global variables, or static structures.\n"
+                     "4. Output ONLY the corrected C code block inside triple backticks. Do not include explanations.\n\n"
+                     "FAILED CODE:\n"
+                     "```c\n%s\n```\n\n"
+                     "COMPILER ERRORS:\n"
+                     "```\n%s\n```",
+                     extracted_c_code, errors);
+        } else {
+            snprintf(current_prompt, sizeof(current_prompt),
+                     "The compilation run was aborted. Please write the custom_func implementation from scratch again following basic standard C conventions.");
+        }
+        free(errors);
+    }
+
+    fprintf(stderr, "[ Failure ] Failed to reach compiler convergence after %d loops. Program aborted.\n", MAX_RETRIES);
+    unlink("temp_jit.c");
+    unlink("temp_jit.so");
+    unlink("cc_errors.log");
 }
 
 int main(int argc, char *argv[]) {
@@ -246,12 +346,15 @@ int main(int argc, char *argv[]) {
 
     curl_global_init(CURL_GLOBAL_ALL);
 
-    // CRITICAL: Immediate check for direct binary file via argv command line arguments
-    if (argc > 1 && strcmp(argv[1], "run") != 0) {
-        // If file exists, immediately execute it and close out
-        if (access(argv[1], F_OK) == 0) {
-            printf("[ Exec ] CLI parameter match found: Loading %s\n", argv[1]);
-            execute_raw_file(argv[1], test_a, test_b);
+    // Dynamic execution optimization: Check if first arg matches local file on disk
+    if (argc > 1) {
+        char *check_file = argv[1];
+        if (strcmp(argv[1], "run") == 0 && argc > 2) {
+            check_file = argv[2];
+        }
+        if (access(check_file, F_OK) == 0) {
+            printf("[ Exec ] Fastpath match on CLI parameter: executing '%s'\n", check_file);
+            execute_raw_file(check_file, test_a, test_b);
             goto cleanup;
         }
     }
@@ -259,24 +362,23 @@ int main(int argc, char *argv[]) {
     char user_prompt[1024];
     char target_bin[256] = "output_bytecode.raw";
 
-    printf("=== LLM dynamic C Function Engine ===\n");
+    printf("=== LLM Dynamic Auto-Correction C Engine ===\n");
     list_available_raw_files();
 
-    printf("Enter command (e.g., 'run filename.raw') OR type an instructions prompt for Gemini:\n> ");
+    printf("Enter command (e.g. 'run filename.raw') OR type structural instructions for Gemini:\n> ");
     if (!fgets(user_prompt, sizeof(user_prompt), stdin)) {
         goto cleanup;
     }
     user_prompt[strcspn(user_prompt, "\r\n")] = '\0';
 
-    // Check if the command starts with "run"
     if (strncmp(user_prompt, "run", 3) == 0) {
         char *filename = user_prompt + 3;
-        while (*filename == ' ') filename++; // drop padded tracking spaces
+        while (*filename == ' ') filename++;
 
         if (strlen(filename) == 0) {
-            fprintf(stderr, "[ Error ] Specify target file destination path: 'run <file>'\n");
+            fprintf(stderr, "[ Error ] Specify target destination: 'run <file.raw>'\n");
         } else {
-            printf("\nEnter validation arguments separated by space (default '14 3'):\n> ");
+            printf("\nEnter two test execution inputs (space-separated, default '14 3'):\n> ");
             char input_buf[64];
             if (fgets(input_buf, sizeof(input_buf), stdin)) {
                 sscanf(input_buf, "%d %d", &test_a, &test_b);
@@ -284,13 +386,12 @@ int main(int argc, char *argv[]) {
             execute_raw_file(filename, test_a, test_b);
         }
     } else {
-        // Standard flow: Query Gemini for C file, build it locally
         if (!has_key) {
-            fprintf(stderr, "[ Critical Error ] Gemini API key authentication token context missing.\n");
+            fprintf(stderr, "[ Critical Error ] Authentication key context could not be resolved.\n");
             goto cleanup;
         }
 
-        printf("\nEnter target output file name context destination (default: 'output_bytecode.raw'):\n> ");
+        printf("\nEnter filename to output raw machine code (default: 'output_bytecode.raw'):\n> ");
         char file_input[256];
         if (fgets(file_input, sizeof(file_input), stdin)) {
             file_input[strcspn(file_input, "\r\n")] = '\0';
@@ -302,9 +403,7 @@ int main(int argc, char *argv[]) {
             strcat(target_bin, ".raw");
         }
 
-        prompt_gemini_and_build(api_key, user_prompt, target_bin);
-        
-        // Execute newly created function immediately
+        auto_negotiate_and_build(api_key, user_prompt, target_bin);
         execute_raw_file(target_bin, test_a, test_b);
     }
 
