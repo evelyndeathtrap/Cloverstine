@@ -10,7 +10,6 @@
 #define BUFFER_SIZE 65536
 #define KEY_FILE_NAME "GEMINI_API_KEY"
 
-// Function pointer signature matching the expected machine code pattern (int fn(int, int))
 typedef int (*BytecodeFunc)(int, int);
 
 struct ResponseBuffer {
@@ -30,7 +29,6 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     return realsize;
 }
 
-// Scans current directory for compiled binary blobs
 void list_available_raw_files(void) {
     DIR *d = opendir(".");
     int count = 0;
@@ -53,34 +51,27 @@ void list_available_raw_files(void) {
     printf("\n");
 }
 
-// Loads the API key from a local file, falls back to environment variable
 int load_api_key(char *dest, size_t max_len) {
     FILE *f = fopen(KEY_FILE_NAME, "r");
     if (f) {
         if (fgets(dest, max_len, f)) {
             dest[strcspn(dest, "\r\n")] = '\0';
             fclose(f);
-            if (strlen(dest) > 0) {
-                printf("[ Auth ] Successfully initialized API key from file: %s\n", KEY_FILE_NAME);
-                return 1;
-            }
+            if (strlen(dest) > 0) return 1;
         }
         fclose(f);
     }
-
     const char *env_key = getenv("GEMINI_API_KEY");
     if (env_key && strlen(env_key) > 0) {
         strncpy(dest, env_key, max_len - 1);
         dest[max_len - 1] = '\0';
-        printf("[ Auth ] Successfully initialized API key from environment variable.\n");
         return 1;
     }
-
     return 0;
 }
 
-// Decodes raw JSON response while skipping backticks and markdown code block pollution
-void extract_clean_hex(const char *json, char *output, size_t max_len) {
+// Extract raw content inside Gemini JSON "text" response string block
+void extract_clean_source(const char *json, char *output, size_t max_len) {
     const char *target = "\"text\": \"";
     char *start = strstr(json, target);
     if (!start) {
@@ -90,38 +81,106 @@ void extract_clean_hex(const char *json, char *output, size_t max_len) {
     start += strlen(target);
     
     size_t out_idx = 0;
+    int in_markdown = 0;
+
     while (*start && *start != '"' && out_idx < max_len - 1) {
-        if (*start == '`' || *start == '\\' || *start == 'n' || *start == ' ' || *start == '\n') {
-            start++;
+        // Look past basic escaped structural characters or Markdown definitions back-to-back
+        if (strncmp(start, "```c", 4) == 0) { start += 4; in_markdown = 1; continue; }
+        if (strncmp(start, "```", 3) == 0) { start += 3; in_markdown = 0; continue; }
+        if (*start == '\\' && *(start + 1) == 'n') {
+            output[out_idx++] = '\n';
+            start += 2;
             continue;
         }
+        if (*start == '\\' && *(start + 1) == '"') {
+            output[out_idx++] = '"';
+            start += 2;
+            continue;
+        }
+        if (*start == '\\' && *(start + 1) == 't') {
+            output[out_idx++] = '\t';
+            start += 2;
+            continue;
+        }
+        
         output[out_idx++] = *start++;
     }
     output[out_idx] = '\0';
 }
 
-unsigned char hex_to_byte(char hi, char lo) {
-    unsigned char b = 0;
-    if (hi >= '0' && hi <= '9') b += (hi - '0') << 4;
-    else if (hi >= 'a' && hi <= 'f') b += (hi - 'a' + 10) << 4;
-    else if (hi >= 'A' && hi <= 'F') b += (hi - 'A' + 10) << 4;
-
-    if (lo >= '0' && lo <= '9') b += (lo - '0');
-    else if (lo >= 'a' && lo <= 'f') b += (lo - 'a' + 10);
-    else if (lo >= 'A' && lo <= 'F') b += (lo - 'A' + 10);
-    return b;
-}
-
-size_t hex_string_to_bytes(const char *hex, unsigned char *dest, size_t max_size) {
-    size_t len = strlen(hex);
-    size_t byte_count = 0;
-    for (size_t i = 0; i + 1 < len && byte_count < max_size; i += 2) {
-        dest[byte_count++] = hex_to_byte(hex[i], hex[i+1]);
+void execute_raw_file(const char *filename, int p1, int p2) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "[ Storage ] Target file missing or invalid: %s\n", filename);
+        return;
     }
-    return byte_count;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fprintf(stderr, "[ Failure ] Target runtime binary file payload is empty.\n");
+        fclose(f);
+        return;
+    }
+
+    unsigned char *buffer = malloc(size);
+    if (!buffer) { fclose(f); return; }
+    size_t read_bytes = fread(buffer, 1, size, f);
+    fclose(f);
+
+    void *exec_mem = mmap(NULL, read_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (exec_mem == MAP_FAILED) {
+        perror("[ Engine ] Execution context memory allocation page fault");
+        free(buffer);
+        return;
+    }
+
+    memcpy(exec_mem, buffer, read_bytes);
+    free(buffer);
+
+    BytecodeFunc LoadedFunc = (BytecodeFunc)exec_mem;
+    printf("[ Engine ] Executing file-loaded bytecode '%s' with inputs (%d, %d)...\n", filename, p1, p2);
+    int res_val = LoadedFunc(p1, p2);
+    printf("[ Engine ] Return code evaluated: %d\n", res_val);
+
+    munmap(exec_mem, read_bytes);
 }
 
-void generate_and_call_prompt(const char *api_key, const char *prompt, const char *save_filename) {
+void compile_source_to_raw(const char *c_code, const char *save_filename) {
+    FILE *src = fopen("temp_jit.c", "w");
+    if (!src) {
+        fprintf(stderr, "[ Failure ] Failed to create temporary source file.\n");
+        return;
+    }
+    // Automatically wrap includes just in case the LLM outputs only raw functions
+    fprintf(src, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n");
+    fprintf(src, "%s\n", c_code);
+    fclose(src);
+
+    char cmd[1024];
+    // Compile to shared library object 
+    snprintf(cmd, sizeof(cmd), "cc -O2 -shared -fPIC temp_jit.c -o temp_jit.so -lm");
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[ Failure ] Local cc engine compilation failed. Invalid C syntax.\n");
+        unlink("temp_jit.c");
+        return;
+    }
+
+    // Extract text segment out directly into raw application bytecode machine code file
+    snprintf(cmd, sizeof(cmd), "objcopy -O binary --only-section=.text temp_jit.so %s", save_filename);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[ Failure ] Extracting machine bytecode via objcopy failed.\n");
+    } else {
+        printf("[ Storage ] Successfully generated compiled bytecode asset -> %s\n", save_filename);
+    }
+
+    unlink("temp_jit.c");
+    unlink("temp_jit.so");
+}
+
+void prompt_gemini_and_build(const char *api_key, const char *prompt, const char *save_filename) {
     CURL *curl;
     CURLcode res;
     struct ResponseBuffer response = { .size = 0 };
@@ -129,10 +188,20 @@ void generate_and_call_prompt(const char *api_key, const char *prompt, const cha
 
     snprintf(url, sizeof(url), "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", api_key);
 
-    char json_payload[2048];
+    // Escape basic quotation constraints safely 
+    char escaped_prompt[2048] = {0};
+    size_t ep_idx = 0;
+    for (size_t i = 0; prompt[i] != '\0' && ep_idx < sizeof(escaped_prompt) - 2; i++) {
+        if (prompt[i] == '"' || prompt[i] == '\\') {
+            escaped_prompt[ep_idx++] = '\\';
+        }
+        escaped_prompt[ep_idx++] = prompt[i];
+    }
+
+    char json_payload[4096];
     snprintf(json_payload, sizeof(json_payload),
-             "{\"contents\": [{\"parts\": [{\"text\": \"Convert this instruction into pure raw x86_64 machine code bytes (System V AMD64 ABI calling convention). Output ONLY the consecutive hexadecimal string. No markdown, no spaces, no backticks, no text. Challenge: %s\"}]}]}",
-             prompt);
+             "{\"contents\": [{\"parts\": [{\"text\": \"Write a single pure C language function named custom_func taking two integers and returning an integer: 'int custom_func(int a, int b)'. Output only code block structure markdown context. No extra chatter or descriptions. Goal: %s\"}]}]}",
+             escaped_prompt);
 
     curl = curl_easy_init();
     if (!curl) return;
@@ -146,150 +215,100 @@ void generate_and_call_prompt(const char *api_key, const char *prompt, const cha
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response);
 
-    printf("[ Pipeline ] Requesting compilation payload from Gemini...\n");
+    printf("[ Pipeline ] Fetching custom C implementation from Gemini API...\n");
     res = curl_easy_perform(curl);
     
     if (res != CURLE_OK) {
         fprintf(stderr, "[ Failure ] Network transmission failed: %s\n", curl_easy_strerror(res));
+        curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         return;
     }
 
-    char hex_output[4096];
-    extract_clean_hex(response.data, hex_output, sizeof(hex_output));
-    
-    if (strlen(hex_output) == 0) {
-        fprintf(stderr, "[ Failure ] Empty token payloads returned. (The model might have included unexpected formatting)\n");
-        curl_easy_cleanup(curl);
-        return;
+    char clean_c_code[8192];
+    extract_clean_source(response.data, clean_c_code, sizeof(clean_c_code));
+
+    if (strlen(clean_c_code) == 0) {
+        fprintf(stderr, "[ Failure ] Empty content extraction returned from API layer.\n");
+    } else {
+        printf("[ Local CC ] Source extracted:\n%s\n", clean_c_code);
+        compile_source_to_raw(clean_c_code, save_filename);
     }
 
-    printf("[ Pipeline ] Raw hex stream parsed: %s\n", hex_output);
-
-    unsigned char binary_code[2048];
-    size_t binary_size = hex_string_to_bytes(hex_output, binary_code, sizeof(binary_code));
-
-    if (binary_size == 0) {
-        fprintf(stderr, "[ Failure ] No valid hex sequences found to process.\n");
-        curl_easy_cleanup(curl);
-        return;
-    }
-
-    FILE *f = fopen(save_filename, "wb");
-    if (f) {
-        fwrite(binary_code, 1, binary_size, f);
-        fclose(f);
-        printf("[ Storage ] Saved block to disk -> %s (%zu bytes)\n", save_filename, binary_size);
-    }
-
-    void *exec_mem = mmap(NULL, binary_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (exec_mem == MAP_FAILED) {
-        perror("[ Engine ] Virtual memory mapping failed");
-        curl_easy_cleanup(curl);
-        return;
-    }
-
-    memcpy(exec_mem, binary_code, binary_size);
-
-    BytecodeFunc JittedFunc = (BytecodeFunc)exec_mem;
-    int a = 14, b = 3;
-    printf("[ Engine ] Executing JIT function code block with default test inputs (%d, %d)...\n", a, b);
-    int res_val = JittedFunc(a, b);
-    printf("[ Engine ] Return code evaluated: %d\n", res_val);
-
-    munmap(exec_mem, binary_size);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 }
 
-void load_and_call_raw_file(const char *filename, int param1, int param2) {
-    FILE *f = fopen(filename, "rb");
-    if (!f) {
-        fprintf(stderr, "[ Storage ] Target file missing or locked: %s\n", filename);
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (size <= 0) {
-        fclose(f);
-        return;
-    }
-
-    unsigned char *buffer = malloc(size);
-    size_t read_bytes = fread(buffer, 1, size, f);
-    fclose(f);
-
-    void *exec_mem = mmap(NULL, read_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (exec_mem == MAP_FAILED) {
-        perror("[ Engine ] Execution context page fault on mapping");
-        free(buffer);
-        return;
-    }
-
-    memcpy(exec_mem, buffer, read_bytes);
-    free(buffer);
-
-    BytecodeFunc LoadedFunc = (BytecodeFunc)exec_mem;
-    printf("[ Engine ] Calling file-loaded bytecode: %s with inputs (%d, %d)...\n", filename, param1, param2);
-    int res_val = LoadedFunc(param1, param2);
-    printf("[ Engine ] Return code evaluated: %d\n", res_val);
-
-    munmap(exec_mem, read_bytes);
-}
-
-int main(void) {
+int main(int argc, char *argv[]) {
     char api_key[256] = {0};
-    if (!load_api_key(api_key, sizeof(api_key))) {
-        fprintf(stderr, "[ Critical ] API Authentication failed. Provide token via local file '%s' or through environment variables.\n", KEY_FILE_NAME);
-        return 1;
-    }
+    int has_key = load_api_key(api_key, sizeof(api_key));
+    int test_a = 14, test_b = 3;
 
     curl_global_init(CURL_GLOBAL_ALL);
 
-    char user_prompt[1024];
-    char target_bin[256];
-    int test_a = 0, test_b = 0;
+    // CRITICAL: Immediate check for direct binary file via argv command line arguments
+    if (argc > 1 && strcmp(argv[1], "run") != 0) {
+        // If file exists, immediately execute it and close out
+        if (access(argv[1], F_OK) == 0) {
+            printf("[ Exec ] CLI parameter match found: Loading %s\n", argv[1]);
+            execute_raw_file(argv[1], test_a, test_b);
+            goto cleanup;
+        }
+    }
 
-    printf("=== LLM JIT Compiler Prompt Shell ===\n");
+    char user_prompt[1024];
+    char target_bin[256] = "output_bytecode.raw";
+
+    printf("=== LLM dynamic C Function Engine ===\n");
     list_available_raw_files();
 
-    // 1. Get user assembly instruction / prompt
-    printf("Enter math instruction for the x86_64 function (e.g., 'Return param1 multiplied by param2 plus 5'):\n> ");
+    printf("Enter command (e.g., 'run filename.raw') OR type an instructions prompt for Gemini:\n> ");
     if (!fgets(user_prompt, sizeof(user_prompt), stdin)) {
         goto cleanup;
     }
-    user_prompt[strcspn(user_prompt, "\r\n")] = '\0'; // Clean newline
+    user_prompt[strcspn(user_prompt, "\r\n")] = '\0';
 
-    // 2. Get target output filename
-    printf("\nEnter output filename to save raw bytecode (e.g., 'my_func.raw'):\n> ");
-    if (!fgets(target_bin, sizeof(target_bin), stdin)) {
-        goto cleanup;
-    }
-    target_bin[strcspn(target_bin, "\r\n")] = '\0'; // Clean newline
+    // Check if the command starts with "run"
+    if (strncmp(user_prompt, "run", 3) == 0) {
+        char *filename = user_prompt + 3;
+        while (*filename == ' ') filename++; // drop padded tracking spaces
 
-    // Ensure it has .raw extension if user omitted it
-    if (!strstr(target_bin, ".raw") && strlen(target_bin) < 250) {
-        strcat(target_bin, ".raw");
-    }
-
-    // 3. Compile and execute
-    printf("\n--- Processing Pipeline ---\n");
-    generate_and_call_prompt(api_key, user_prompt, target_bin);
-
-    // 4. Test execution on arbitrary custom parameters
-    printf("\n--- Test Suite Reload ---\n");
-    printf("Enter two integers to pass into your new raw binary file (separated by space):\n> ");
-    if (scanf("%d %d", &test_a, &test_b) == 2) {
-        load_and_call_raw_file(target_bin, test_a, test_b);
+        if (strlen(filename) == 0) {
+            fprintf(stderr, "[ Error ] Specify target file destination path: 'run <file>'\n");
+        } else {
+            printf("\nEnter validation arguments separated by space (default '14 3'):\n> ");
+            char input_buf[64];
+            if (fgets(input_buf, sizeof(input_buf), stdin)) {
+                sscanf(input_buf, "%d %d", &test_a, &test_b);
+            }
+            execute_raw_file(filename, test_a, test_b);
+        }
     } else {
-        printf("[ Engine ] Invalid inputs. Skipping custom verification test.\n");
+        // Standard flow: Query Gemini for C file, build it locally
+        if (!has_key) {
+            fprintf(stderr, "[ Critical Error ] Gemini API key authentication token context missing.\n");
+            goto cleanup;
+        }
+
+        printf("\nEnter target output file name context destination (default: 'output_bytecode.raw'):\n> ");
+        char file_input[256];
+        if (fgets(file_input, sizeof(file_input), stdin)) {
+            file_input[strcspn(file_input, "\r\n")] = '\0';
+            if (strlen(file_input) > 0) {
+                strncpy(target_bin, file_input, sizeof(target_bin) - 1);
+            }
+        }
+        if (!strstr(target_bin, ".raw") && strlen(target_bin) < 250) {
+            strcat(target_bin, ".raw");
+        }
+
+        prompt_gemini_and_build(api_key, user_prompt, target_bin);
+        
+        // Execute newly created function immediately
+        execute_raw_file(target_bin, test_a, test_b);
     }
 
 cleanup:
     curl_global_cleanup();
-    printf("\n[ System ] Pipeline session closed.\n");
     return 0;
 }
