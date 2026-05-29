@@ -75,7 +75,8 @@ int load_api_key(char *dest, size_t max_len) {
     return 0;
 }
 
-// Decodes and extracts code contents directly out of the incoming Gemini JSON context
+// Decodes and extracts code contents directly out of the incoming Gemini JSON context,
+// unescaping unicode sequences like \u003c and standard JSON escapes.
 void extract_clean_source(const char *json, char *output, size_t max_len) {
     const char *target = "\"text\": \"";
     char *start = strstr(json, target);
@@ -90,19 +91,62 @@ void extract_clean_source(const char *json, char *output, size_t max_len) {
         // Strip markdown backticks standard output formats safely
         if (strncmp(start, "```c", 4) == 0) { start += 4; continue; }
         if (strncmp(start, "```", 3) == 0) { start += 3; continue; }
-        if (*start == '\\' && *(start + 1) == 'n') {
-            output[out_idx++] = '\n';
-            start += 2;
-            continue;
-        }
-        if (*start == '\\' && *(start + 1) == '"') {
-            output[out_idx++] = '"';
-            start += 2;
-            continue;
-        }
-        if (*start == '\\' && *(start + 1) == 't') {
-            output[out_idx++] = '\t';
-            start += 2;
+        
+        // Handle JSON Escape decoding
+        if (*start == '\\') {
+            if (*(start + 1) == 'n') {
+                output[out_idx++] = '\n';
+                start += 2;
+            } else if (*(start + 1) == '"') {
+                output[out_idx++] = '"';
+                start += 2;
+            } else if (*(start + 1) == '\\') {
+                output[out_idx++] = '\\';
+                start += 2;
+            } else if (*(start + 1) == 't') {
+                output[out_idx++] = '\t';
+                start += 2;
+            } else if (*(start + 1) == 'r') {
+                output[out_idx++] = '\r';
+                start += 2;
+            } else if (*(start + 1) == 'f') {
+                output[out_idx++] = '\f';
+                start += 2;
+            } else if (*(start + 1) == 'b') {
+                output[out_idx++] = '\b';
+                start += 2;
+            } else if (*(start + 1) == '/') {
+                output[out_idx++] = '/';
+                start += 2;
+            } else if (*(start + 1) == 'u') {
+                // Decode \uXXXX Unicode hexadecimal sequences
+                if (start[2] && start[3] && start[4] && start[5]) {
+                    char hex[5] = { start[2], start[3], start[4], start[5], '\0' };
+                    unsigned int codepoint = (unsigned int)strtol(hex, NULL, 16);
+                    
+                    // Standard ASCII translation
+                    if (codepoint < 128) {
+                        output[out_idx++] = (char)codepoint;
+                    } else if (codepoint < 0x800) { // Multi-byte UTF-8 translation for robustness
+                        if (out_idx < max_len - 2) {
+                            output[out_idx++] = (char)(0xC0 | (codepoint >> 6));
+                            output[out_idx++] = (char)(0x80 | (codepoint & 0x3F));
+                        }
+                    } else {
+                        if (out_idx < max_len - 3) {
+                            output[out_idx++] = (char)(0xE0 | (codepoint >> 12));
+                            output[out_idx++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                            output[out_idx++] = (char)(0x80 | (codepoint & 0x3F));
+                        }
+                    }
+                    start += 6;
+                } else {
+                    output[out_idx++] = *start++;
+                }
+            } else {
+                // Non-standard escape fallback
+                output[out_idx++] = *start++;
+            }
             continue;
         }
         output[out_idx++] = *start++;
