@@ -55,11 +55,9 @@ void list_available_raw_files(void) {
 
 // Loads the API key from a local file, falls back to environment variable
 int load_api_key(char *dest, size_t max_len) {
-    // Try loading from local file first
     FILE *f = fopen(KEY_FILE_NAME, "r");
     if (f) {
         if (fgets(dest, max_len, f)) {
-            // Strip trailing newlines or carriage returns
             dest[strcspn(dest, "\r\n")] = '\0';
             fclose(f);
             if (strlen(dest) > 0) {
@@ -70,7 +68,6 @@ int load_api_key(char *dest, size_t max_len) {
         fclose(f);
     }
 
-    // Fallback to environment
     const char *env_key = getenv("GEMINI_API_KEY");
     if (env_key && strlen(env_key) > 0) {
         strncpy(dest, env_key, max_len - 1);
@@ -94,7 +91,6 @@ void extract_clean_hex(const char *json, char *output, size_t max_len) {
     
     size_t out_idx = 0;
     while (*start && *start != '"' && out_idx < max_len - 1) {
-        // Skip common markdown code formatting artifacts added by LLMs
         if (*start == '`' || *start == '\\' || *start == 'n' || *start == ' ' || *start == '\n') {
             start++;
             continue;
@@ -163,7 +159,7 @@ void generate_and_call_prompt(const char *api_key, const char *prompt, const cha
     extract_clean_hex(response.data, hex_output, sizeof(hex_output));
     
     if (strlen(hex_output) == 0) {
-        fprintf(stderr, "[ Failure ] Empty token payloads returned.\n");
+        fprintf(stderr, "[ Failure ] Empty token payloads returned. (The model might have included unexpected formatting)\n");
         curl_easy_cleanup(curl);
         return;
     }
@@ -179,7 +175,6 @@ void generate_and_call_prompt(const char *api_key, const char *prompt, const cha
         return;
     }
 
-    // Export raw binary blob to disk
     FILE *f = fopen(save_filename, "wb");
     if (f) {
         fwrite(binary_code, 1, binary_size, f);
@@ -187,7 +182,6 @@ void generate_and_call_prompt(const char *api_key, const char *prompt, const cha
         printf("[ Storage ] Saved block to disk -> %s (%zu bytes)\n", save_filename, binary_size);
     }
 
-    // Allocate runtime engine page frame with RX access controls
     void *exec_mem = mmap(NULL, binary_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (exec_mem == MAP_FAILED) {
         perror("[ Engine ] Virtual memory mapping failed");
@@ -197,10 +191,9 @@ void generate_and_call_prompt(const char *api_key, const char *prompt, const cha
 
     memcpy(exec_mem, binary_code, binary_size);
 
-    // Call dynamic function
     BytecodeFunc JittedFunc = (BytecodeFunc)exec_mem;
     int a = 14, b = 3;
-    printf("[ Engine ] Executing JIT function code block with inputs (%d, %d)...\n", a, b);
+    printf("[ Engine ] Executing JIT function code block with default test inputs (%d, %d)...\n", a, b);
     int res_val = JittedFunc(a, b);
     printf("[ Engine ] Return code evaluated: %d\n", res_val);
 
@@ -256,20 +249,47 @@ int main(void) {
 
     curl_global_init(CURL_GLOBAL_ALL);
 
-    // 1. Initial workspace status
+    char user_prompt[1024];
+    char target_bin[256];
+    int test_a = 0, test_b = 0;
+
+    printf("=== LLM JIT Compiler Prompt Shell ===\n");
     list_available_raw_files();
 
-    // 2. Query dynamic math generation (returns arg1 - arg2)
-    const char *prompt = "Return parameter 1 minus parameter 2.";
-    const char *target_bin = "subtract_function.raw";
-    generate_and_call_prompt(api_key, prompt, target_bin);
+    // 1. Get user assembly instruction / prompt
+    printf("Enter math instruction for the x86_64 function (e.g., 'Return param1 multiplied by param2 plus 5'):\n> ");
+    if (!fgets(user_prompt, sizeof(user_prompt), stdin)) {
+        goto cleanup;
+    }
+    user_prompt[strcspn(user_prompt, "\r\n")] = '\0'; // Clean newline
 
-    // 3. Re-scan working path reflecting changes
-    list_available_raw_files();
+    // 2. Get target output filename
+    printf("\nEnter output filename to save raw bytecode (e.g., 'my_func.raw'):\n> ");
+    if (!fgets(target_bin, sizeof(target_bin), stdin)) {
+        goto cleanup;
+    }
+    target_bin[strcspn(target_bin, "\r\n")] = '\0'; // Clean newline
 
-    // 4. Reload compiled asset straight to hardware context engine
-    load_and_call_raw_file(target_bin, 100, 42);
+    // Ensure it has .raw extension if user omitted it
+    if (!strstr(target_bin, ".raw") && strlen(target_bin) < 250) {
+        strcat(target_bin, ".raw");
+    }
 
+    // 3. Compile and execute
+    printf("\n--- Processing Pipeline ---\n");
+    generate_and_call_prompt(api_key, user_prompt, target_bin);
+
+    // 4. Test execution on arbitrary custom parameters
+    printf("\n--- Test Suite Reload ---\n");
+    printf("Enter two integers to pass into your new raw binary file (separated by space):\n> ");
+    if (scanf("%d %d", &test_a, &test_b) == 2) {
+        load_and_call_raw_file(target_bin, test_a, test_b);
+    } else {
+        printf("[ Engine ] Invalid inputs. Skipping custom verification test.\n");
+    }
+
+cleanup:
     curl_global_cleanup();
+    printf("\n[ System ] Pipeline session closed.\n");
     return 0;
 }
